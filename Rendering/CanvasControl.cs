@@ -91,12 +91,25 @@ public sealed class CanvasControl : Control
     private readonly VScrollBar _vbar = new();
     private readonly System.Windows.Forms.Timer _antsTimer;
     private readonly System.Windows.Forms.Timer _sprayTimer;
+    private readonly System.Windows.Forms.Timer _edgeTimer;
+    private readonly Label _dragInfo = new()
+    {
+        AutoSize = true,
+        Visible = false,
+        BackColor = Color.FromArgb(255, 251, 222),
+        BorderStyle = BorderStyle.FixedSingle,
+        Padding = new Padding(3, 0, 3, 0),
+        Font = new Font("Microsoft JhengHei UI", 8.25f),
+    };
 
     private double _zoom = 1.0;
     private double _scrollX, _scrollY;   // 影像像素
     private Point _panStart;
     private double _panScrollX, _panScrollY;
     private bool _panning;
+    private bool _spacePan;              // 空白鍵＋左鍵＝平移（無中鍵滑鼠的替代）
+    private bool _leftDown;              // 拖曳中靠近視埠邊緣時自動捲動
+    private Point _lastMouse;            // 最新滑鼠客戶區座標
     private int _antPhase;
     private Bitmap? _checkerTile;
 
@@ -117,8 +130,10 @@ public sealed class CanvasControl : Control
             _tool = value;
             value.Canvas = this;
             Cursor = value.Cursor;
+            ShowDragInfo(null);
             Invalidate();
             ToolHint?.Invoke(value.Hint);
+            ToolChanged?.Invoke(this, EventArgs.Empty);
         }
     }
 
@@ -129,6 +144,7 @@ public sealed class CanvasControl : Control
     }
 
     public event Action<string>? ToolHint;
+    public event EventHandler? ToolChanged;
     public event Action<Point?>? PointerMoved;
     public event EventHandler? ZoomChanged;
     public event Action<int, Color>? ColorChanged;
@@ -161,6 +177,13 @@ public sealed class CanvasControl : Control
         _sprayTimer = new System.Windows.Forms.Timer { Interval = 60 };
         _sprayTimer.Tick += (_, _) => _tool?.OnTick();
 
+        // 拖曳接近視埠邊緣時自動捲動（繪圖/選取拖出可見範圍）
+        _edgeTimer = new System.Windows.Forms.Timer { Interval = 30 };
+        _edgeTimer.Tick += (_, _) => EdgeScrollTick();
+        _edgeTimer.Start();
+
+        Controls.Add(_dragInfo);
+
         _checkerTile = BuildCheckerTile();
 
         Doc.Changed += (_, _) => Invalidate();
@@ -172,6 +195,7 @@ public sealed class CanvasControl : Control
         MouseUp += OnUp;
         MouseLeave += (_, _) => PointerMoved?.Invoke(null);
         MouseWheel += OnWheel;
+        MouseCaptureChanged += OnCaptureChanged;
     }
 
     private static Bitmap BuildCheckerTile()
@@ -229,6 +253,7 @@ public sealed class CanvasControl : Control
         _scrollY = anchor.Y - (anchor.Y - _scrollY) * old / z;
         UpdateScrollbars();
         _tool?.OnViewChanged();
+        if (!_panning && !_spacePan) Cursor = _tool?.Cursor ?? Cursors.Default;
         ZoomChanged?.Invoke(this, EventArgs.Empty);
         Invalidate();
     }
@@ -251,6 +276,7 @@ public sealed class CanvasControl : Control
     {
         base.OnSizeChanged(e);
         UpdateScrollbars();
+        Invalidate();   // 尺寸變動（含拖曳調整視窗）時整幅重繪，捲軸隱現不留殘影
     }
 
     private void UpdateScrollbars()
@@ -279,8 +305,9 @@ public sealed class CanvasControl : Control
         _vbar.Value = (int)_scrollY;
 
         var layout = ClientRectangle;
-        _vbar.Bounds = new Rectangle(layout.Right - BarW, 0, BarW, layout.Height - (_hbar.Visible ? BarW : 0));
-        _hbar.Bounds = new Rectangle(0, layout.Bottom - BarW, layout.Width - (_vbar.Visible ? BarW : 0), BarW);
+        // 兩條捲軸都鋪滿整邊，角落重疊處由 z 序覆蓋，避免右下角露出未繪製缺口
+        _vbar.Bounds = new Rectangle(layout.Right - BarW, 0, BarW, layout.Height);
+        _hbar.Bounds = new Rectangle(0, layout.Bottom - BarW, layout.Width, BarW);
     }
 
     private void CenterView()
@@ -297,28 +324,34 @@ public sealed class CanvasControl : Control
     private void OnDown(object? sender, MouseEventArgs e)
     {
         Focus();
-        if (e.Button == MouseButtons.Middle)
+        _lastMouse = e.Location;
+        if (e.Button == MouseButtons.Middle || (e.Button == MouseButtons.Left && _spacePan))
         {
             _panning = true;
             _panStart = e.Location;
             _panScrollX = _scrollX; _panScrollY = _scrollY;
             Cursor = Cursors.SizeAll;
+            Capture = true;
             return;
         }
         var p = ToImage(e.Location);
         if (e.Button == MouseButtons.Left)
         {
             _sprayTimer.Enabled = false;
+            _leftDown = true;
+            Capture = true; // 擷取滑鼠：放開在畫布外也能收到 Up，工具不會卡住
             _tool.OnMouseDown(p, e.Button);
         }
         else if (e.Button == MouseButtons.Right)
         {
+            Capture = true;
             _tool.OnMouseDown(p, e.Button);
         }
     }
 
     private void OnMove(object? sender, MouseEventArgs e)
     {
+        _lastMouse = e.Location;
         if (_panning)
         {
             _scrollX = Math.Max(0, _panScrollX - (e.X - _panStart.X) / _zoom);
@@ -329,19 +362,80 @@ public sealed class CanvasControl : Control
         }
         var p = ToImage(e.Location);
         PointerMoved?.Invoke(new Point((int)Math.Floor(p.X), (int)Math.Floor(p.Y)));
-        _tool.OnMouseMove(p, e.Button);
+        // 游標即時跟隨工具粗細/縮放（Cursor setter 內部會比較相等性，可安全重複指定）
+        if (!_panning && !_spacePan) Cursor = _tool.Cursor;
+        _tool.OnMouseMove(p, e.Button); // 工具可在此覆寫游標（如選取把手的方向箭頭）
+        if (_dragInfo.Visible) PositionDragInfo();
     }
 
     private void OnUp(object? sender, MouseEventArgs e)
     {
-        if (_panning && e.Button == MouseButtons.Middle)
+        if (_panning && e.Button is MouseButtons.Middle or MouseButtons.Left)
         {
             _panning = false;
-            Cursor = ActiveTool.Cursor;
+            Capture = false;
+            Cursor = _spacePan ? Cursors.SizeAll : ActiveTool.Cursor;
             return;
         }
+        if (e.Button == MouseButtons.Left) _leftDown = false;
+        if (!Capture && !_leftDown) return;
+        Capture = false;
         var p = ToImage(e.Location);
         _tool.OnMouseUp(p, e.Button);
+        ShowDragInfo(null);
+    }
+
+    /// <summary>擷取被外部搶走（如 Alt+Tab）：補發 Up，避免工具卡在拖曳狀態。</summary>
+    private void OnCaptureChanged(object? sender, EventArgs e)
+    {
+        if (Capture || (!_leftDown && !_panning)) return;
+        _panning = false;
+        if (_leftDown)
+        {
+            _leftDown = false;
+            _tool.OnMouseUp(ToImage(_lastMouse), MouseButtons.Left);
+            ShowDragInfo(null);
+        }
+        Cursor = ActiveTool.Cursor;
+    }
+
+    /// <summary>拖曳中滑鼠靠近視埠邊緣 → 定時朝該方向捲動（小畫家行為）。</summary>
+    private void EdgeScrollTick()
+    {
+        if (!_leftDown || _panning) return;
+        bool canX = Doc.Size.Width * _zoom > ClientSize.Width;
+        bool canY = Doc.Size.Height * _zoom > ClientSize.Height;
+        if (!canX && !canY) return;
+
+        const int margin = 36;
+        double speed = Math.Max(1.0, 16 / _zoom); // 每 tick 約 16 螢幕像素
+        double dx = 0, dy = 0;
+        if (_lastMouse.X < margin) dx = -speed;
+        else if (_lastMouse.X > ClientSize.Width - margin) dx = speed;
+        if (_lastMouse.Y < margin) dy = -speed;
+        else if (_lastMouse.Y > ClientSize.Height - margin) dy = speed;
+        if (dx == 0 && dy == 0) return;
+
+        _scrollX += canX ? dx : 0;
+        _scrollY += canY ? dy : 0;
+        UpdateScrollbars();
+        Invalidate();
+    }
+
+    /// <summary>在滑鼠旁顯示拖曳即時資訊（尺寸/位置）；null 隱藏。</summary>
+    public void ShowDragInfo(string? text)
+    {
+        if (text is null) { _dragInfo.Visible = false; return; }
+        if (_dragInfo.Text != text) _dragInfo.Text = text;
+        if (!_dragInfo.Visible) { _dragInfo.Visible = true; _dragInfo.BringToFront(); }
+        PositionDragInfo();
+    }
+
+    private void PositionDragInfo()
+    {
+        int x = Math.Min(_lastMouse.X + 16, ClientSize.Width - _dragInfo.Width - 4);
+        int y = Math.Min(_lastMouse.Y + 20, ClientSize.Height - _dragInfo.Height - 4);
+        _dragInfo.Location = new Point(Math.Max(2, x), Math.Max(2, y));
     }
 
     private void OnWheel(object? sender, MouseEventArgs e)
@@ -370,10 +464,31 @@ public sealed class CanvasControl : Control
     /// <summary>提交文字工具的待確定編輯（undo/redo 前呼叫）。</summary>
     public void CommitActiveText() => (ActiveTool as Tools.TextTool)?.CommitPending();
 
+    protected override bool IsInputKey(Keys keyData) => keyData == Keys.Space || base.IsInputKey(keyData);
+
     protected override void OnKeyDown(KeyEventArgs e)
     {
+        if (e.KeyCode == Keys.Space && !_spacePan)
+        {
+            _spacePan = true;
+            if (!_panning) Cursor = Cursors.SizeAll;
+            e.Handled = true;
+            return;
+        }
         if (_tool.WantsKeys) _tool.OnKeyDown(e);
         base.OnKeyDown(e);
+    }
+
+    protected override void OnKeyUp(KeyEventArgs e)
+    {
+        if (e.KeyCode == Keys.Space)
+        {
+            _spacePan = false;
+            if (!_panning) Cursor = ActiveTool.Cursor;
+            e.Handled = true;
+            return;
+        }
+        base.OnKeyUp(e);
     }
 
     // ------------------------------------------------------------ 繪製
@@ -403,7 +518,10 @@ public sealed class CanvasControl : Control
             g.FillRectangle(tb, Rectangle.Round(imgRect));
         }
 
-        g.DrawImage(Doc.Compose(), imgRect);
+        // 逐層直接合成（不使用 Doc.Compose() 快取：筆刷拖曳直接改圖層位圖、不會失效快取，
+        // 會造成「放開滑鼠才看到線條」與縮放視窗時的殘影）
+        foreach (var l in Doc.Layers)
+            if (l.Visible) g.DrawImage(l.Image, imgRect);
 
         // 紙緣
         using (var border = new Pen(Color.Gray))
@@ -417,7 +535,7 @@ public sealed class CanvasControl : Control
             m.Translate((float)(ox - _scrollX * _zoom), (float)(oy - _scrollY * _zoom));
             g.MultiplyTransform(m);
             g.InterpolationMode = _zoom > 1.5 ? InterpolationMode.NearestNeighbor : InterpolationMode.HighQualityBilinear;
-            try { _tool.Preview(g); }
+            try { _tool?.Preview(g); }
             finally { g.Restore(state); }
         }
 
@@ -468,11 +586,9 @@ public sealed class CanvasControl : Control
             ? (GraphicsPath)Selection.LassoPath!.Clone()
             : null;
         GraphicsPath target;
-        bool owned;
         if (path is not null)
         {
             target = path;
-            owned = true;
             var baseOrigin = ToScreen(PointF.Empty);
             using var mt = new Matrix();
             mt.Scale((float)_zoom, (float)_zoom);
@@ -485,7 +601,6 @@ public sealed class CanvasControl : Control
             var s0 = ToScreen(new PointF(r.X, r.Y));
             target = new GraphicsPath();
             target.AddRectangle(new RectangleF(s0.X, s0.Y, (float)(r.Width * _zoom), (float)(r.Height * _zoom)));
-            owned = true;
         }
 
         using (target)

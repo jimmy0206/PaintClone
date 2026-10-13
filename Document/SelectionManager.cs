@@ -89,7 +89,8 @@ public sealed class SelectionManager : IDisposable
     {
         SelMode.Rect => Rect.Contains(p),
         SelMode.Lasso => LassoPath!.IsVisible(p),
-        SelMode.Mask => MaskBounds.Contains(p) && _mask![(p.Y - MaskBounds.Y) * _maskW + (p.X - MaskBounds.X)],
+        // 遮罩陣列以全畫布座標索引（與 GetRegion/GetBoundaryPixels 一致）
+        SelMode.Mask => MaskBounds.Contains(p) && _mask![p.Y * _maskW + p.X],
         _ => false,
     };
 
@@ -196,6 +197,48 @@ public sealed class SelectionManager : IDisposable
             }
         _boundaryCache = list.ToArray();
         return _boundaryCache;
+    }
+
+    /// <summary>整體平移選取（拖曳移動/方向鍵微調後讓螞蟻線跟隨內容）。</summary>
+    public void Translate(int dx, int dy)
+    {
+        if (!IsActive || (dx == 0 && dy == 0)) return;
+        switch (Mode)
+        {
+            case SelMode.Rect:
+                Rect = new Rectangle(Rect.X + dx, Rect.Y + dy, Rect.Width, Rect.Height);
+                break;
+            case SelMode.Lasso:
+                using (var m = new Matrix())
+                {
+                    m.Translate(dx, dy);
+                    LassoPath!.Transform(m);
+                }
+                break;
+            case SelMode.Mask:
+            {
+                // 遮罩陣列為全畫布尺寸，需整體位移後重建
+                int w = _maskW, h = _mask!.Length / w;
+                var shifted = new bool[_mask.Length];
+                for (int y = 0; y < h; y++)
+                {
+                    int ny = y + dy;
+                    if (ny < 0 || ny >= h) continue;
+                    int srcRow = y * w, dstRow = ny * w;
+                    for (int x = 0; x < w; x++)
+                    {
+                        if (!_mask[srcRow + x]) continue;
+                        int nx = x + dx;
+                        if (nx >= 0 && nx < w) shifted[dstRow + nx] = true;
+                    }
+                }
+                _mask = shifted;
+                MaskBounds = new Rectangle(MaskBounds.X + dx, MaskBounds.Y + dy, MaskBounds.Width, MaskBounds.Height);
+                _boundaryCache = null;
+                break;
+            }
+        }
+        Changed?.Invoke(this, EventArgs.Empty);
     }
 
     public void Dispose() => ClearCore();

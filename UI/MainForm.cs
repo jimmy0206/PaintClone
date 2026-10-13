@@ -16,12 +16,21 @@ public sealed class MainForm : Form
     private readonly ColorPanel _colorPanel = new();
     private readonly ToolStrip _toolStrip = new();
     private readonly MenuStrip _menu = new();
-    private readonly StatusStrip _status = new();
-    private readonly ToolStripStatusLabel _hintLabel = new() { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
-    private readonly ToolStripStatusLabel _posLabel = new();
-    private readonly ToolStripStatusLabel _sizeLabel = new();
-    private readonly ToolStripStatusLabel _zoomLabel = new();
+    private readonly Panel _status = new() { Dock = DockStyle.Bottom, Padding = new Padding(6, 2, 24, 2) };
+    private readonly Label _hintLabel = new() { AutoSize = false, Dock = DockStyle.Left, AutoEllipsis = true, TextAlign = ContentAlignment.MiddleLeft };
+    private readonly Label _posLabel = new() { AutoSize = true, Dock = DockStyle.Right, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(8, 0, 8, 0) };
+    private readonly Label _sizeLabel = new() { AutoSize = true, Dock = DockStyle.Right, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(8, 0, 8, 0) };
+    private readonly Label _zoomLabel = new()
+    {
+        AutoSize = true,
+        Dock = DockStyle.Right,
+        TextAlign = ContentAlignment.MiddleLeft,
+        Padding = new Padding(8, 0, 8, 0),
+        ForeColor = SystemColors.HotTrack,
+        Cursor = Cursors.Hand,
+    };
     private readonly System.Windows.Forms.Timer _autoSaveTimer = new();
+    private readonly ToolTip _toolTip = new();
 
     private ToolStripButton _undoBtn = null!, _redoBtn = null!;
     private ToolStripDropDownButton _sizeDrop = null!, _styleDrop = null!, _optionsDrop = null!;
@@ -31,6 +40,15 @@ public sealed class MainForm : Form
     // 圖層面板
     private readonly Panel _layerPanel = new();
     private readonly ListView _layerList = new();
+    private Panel? _layerButtonsPanel;
+    private readonly List<Button> _layerButtons = new();
+    private readonly Splitter _layerSplitter = new()
+    {
+        Dock = DockStyle.Right,
+        Width = 5,
+        MinSize = 150,
+    };
+    private ContextMenuStrip _zoomMenu = null!;
 
     private readonly PencilTool _pencil = new();
     private readonly BrushTool _brush = new();
@@ -55,8 +73,13 @@ public sealed class MainForm : Form
     public MainForm()
     {
         Text = AppTitle;
-        Width = _settings.WindowWidth;
-        Height = _settings.WindowHeight;
+        // 以 96dpi 為設計基準，依裝置 DPI 遞迴縮放全部控制項（高 DPI 下不再跑版）
+        AutoScaleMode = AutoScaleMode.Dpi;
+        AutoScaleDimensions = new SizeF(96F, 96F);
+        DoubleBuffered = true;   // 拖曳調整視窗大小的過程整幅離屏合成，消除 dock 重排閃爍/殘留
+        StartPosition = FormStartPosition.CenterScreen;
+        Width = 1000;   // 實際大小於 OnShown 以實體像素還原（存檔值不再經 DPI 二次縮放）
+        Height = 700;
         WindowState = _settings.Maximized ? FormWindowState.Maximized : FormWindowState.Normal;
         BackColor = SystemColors.Control;
         KeyPreview = true;
@@ -74,13 +97,17 @@ public sealed class MainForm : Form
         BuildColorPanel();
         BuildLayerPanel();
         BuildStatus();
+        BuildZoomMenu();
 
+        // Dock 由後加入者先排：splitter 要排在圖層面板左緣，必須比面板先加入
         Controls.Add(_canvas);
+        Controls.Add(_layerSplitter);
         Controls.Add(_layerPanel);
         Controls.Add(_colorPanel);
         Controls.Add(_toolStrip);
         Controls.Add(_menu);
         Controls.Add(_status);
+        _layerSplitter.Visible = _layerPanel.Visible;
         MainMenuStrip = _menu;
 
         // 事件接線
@@ -90,10 +117,17 @@ public sealed class MainForm : Form
         _doc.Changed += (_, _) => UpdateUndoButtons();
         _doc.StructureChanged += (_, _) => { RefreshLayerList(); UpdateStatusSize(); UpdateTitle(); UpdateUndoButtons(); };
         _canvas.ColorChanged += (which, c) => { _colorPanel.SetFromExternal(which, c); _colorPanel.PushRecent(c); };
+        _canvas.ToolChanged += (_, _) =>
+        {
+            foreach (var (name, btn) in _toolButtons)
+                btn.Checked = _canvas.ActiveTool.Name == name;
+            UpdateSizeDropCaption();
+        };
         DragEnter += OnDragEnter;
         DragDrop += OnDragDrop;
         _canvas.DragEnter += OnDragEnter;
         _canvas.DragDrop += OnDragDrop;
+        _canvas.Selection.Changed += (_, _) => UpdateStatusSize();
 
         _colorPanel.LoadPersisted(_settings.RecentColorsHex);
         _canvas.ActiveTool = _pencil;
@@ -133,10 +167,15 @@ public sealed class MainForm : Form
         _toolStrip.GripStyle = ToolStripGripStyle.Hidden;
         _toolStrip.ImageScalingSize = new Size(22, 22);
         _toolStrip.Padding = new Padding(4, 2, 4, 2);
+        // Flow 佈局：寬度不足時自動換行（取代溢出箭頭），高度由 RelayoutToolStrip 動態調整
+        _toolStrip.LayoutStyle = ToolStripLayoutStyle.Flow;
+        _toolStrip.AutoSize = false;
+        _toolStrip.Height = 34;
 
         ToolStripButton Icon(string kind, Action click, string tip)
         {
             var b = new ToolStripButton(IconFactory.Make(kind)) { ToolTipText = tip, AutoToolTip = false, DisplayStyle = ToolStripItemDisplayStyle.Image };
+            b.AccessibleName = kind; // 供 ApplyHiDpiOnce 依原樣式高解析重繪
             b.Click += (_, _) => click();
             return b;
         }
@@ -164,6 +203,7 @@ public sealed class MainForm : Form
             var btn = new ToolStripButton(IconFactory.Make(kind))
             {
                 Tag = tool,
+                AccessibleName = kind,
                 ToolTipText = tool.Name,
                 AutoToolTip = false,
                 DisplayStyle = ToolStripItemDisplayStyle.Image,
@@ -208,6 +248,11 @@ public sealed class MainForm : Form
         _layerPanel.Width = 190;
         _layerPanel.Visible = _settings.ShowLayersPanel;
         _layerPanel.Padding = new Padding(6);
+        _layerSplitter.MouseUp += (_, _) =>
+        {
+            int max = (int)(420 * DeviceDpi / 96f);   // 上限亦依 DPI 換算（實體像素）
+            if (_layerPanel.Width > max) _layerPanel.Width = max;
+        };
 
         var title = new Label { Text = "圖層", Dock = DockStyle.Top, AutoSize = true, Font = new Font(Font, FontStyle.Bold) };
         _layerList.Dock = DockStyle.Fill;
@@ -215,16 +260,48 @@ public sealed class MainForm : Form
         _layerList.FullRowSelect = true;
         _layerList.HideSelection = false;
         _layerList.CheckBoxes = true;
-        _layerList.Columns.Add("名稱", 120);
-        _layerList.Columns.Add("屬性", 40);
+        _layerList.Columns.Add("名稱", 100);
+        _layerList.Columns.Add("屬性", 50);
         _layerList.ItemCheck += OnLayerItemCheck;
         _layerList.SelectedIndexChanged += OnLayerSelectedChanged;
 
-        var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 64, WrapContents = true };
+        // 拖曳排序（优化：不用按上移/下移按鈕）
+        _layerList.AllowDrop = true;
+        _layerList.ItemDrag += (_, e) =>
+        {
+            if (e.Item is ListViewItem it && _doc.Layers.Count > 1)
+                _layerList.DoDragDrop(it, DragDropEffects.Move);
+        };
+        _layerList.DragEnter += (_, e) =>
+            e.Effect = e.Data?.GetDataPresent(typeof(ListViewItem)) == true ? DragDropEffects.Move : DragDropEffects.None;
+        _layerList.DragOver += (_, e) =>
+        {
+            var pt = _layerList.PointToClient(new Point(e.X, e.Y));
+            int idx = _layerList.GetItemAt(pt.X, pt.Y)?.Index ?? -1;
+            if (idx >= 0 && (_layerList.SelectedIndices.Count != 1 || _layerList.SelectedIndices[0] != idx))
+            {
+                _suppressLayerEvents = true;
+                _layerList.SelectedIndices.Clear();
+                _layerList.Items[idx].Selected = true;   // 以反白提示放下的位置
+                _suppressLayerEvents = false;
+            }
+            e.Effect = DragDropEffects.Move;
+        };
+        _layerList.DragDrop += (_, e) =>
+        {
+            if (e.Data?.GetData(typeof(ListViewItem)) is not ListViewItem it) return;
+            var pt = _layerList.PointToClient(new Point(e.X, e.Y));
+            int dst = _layerList.GetItemAt(pt.X, pt.Y)?.Index ?? -1;
+            if (dst >= 0) ReorderLayer(it.Index, dst);
+        };
+
+        // 手動 2 欄置中排列（LayoutLayerButtons），高度依 DPI 計算，不受 AutoSize 行為影響
+        var buttons = new Panel { Dock = DockStyle.Bottom };
         Button Small(string text, Action act)
         {
-            var b = new Button { Text = text, Width = 84, Height = 24, Margin = new Padding(1) };
+            var b = new Button { Text = text };
             b.Click += (_, _) => act();
+            _layerButtons.Add(b);
             return b;
         }
         buttons.Controls.AddRange(new Control[]
@@ -233,15 +310,62 @@ public sealed class MainForm : Form
             Small("上移", () => MoveLayer(-1)), Small("下移", () => MoveLayer(1)),
             Small("向下合併", MergeDown), Small("透明化背景", FlattenTransparent),
         });
+        _layerButtonsPanel = buttons;
+        _layerPanel.Resize += (_, _) => LayoutLayerButtons();
 
         _layerPanel.Controls.Add(_layerList);
         _layerPanel.Controls.Add(buttons);
         _layerPanel.Controls.Add(title);
+        LayoutLayerButtons();
+    }
+
+    /// <summary>圖層按鈕固定 2 欄 × 3 列，尺寸依 DeviceDpi 換算（跑版防禦）。</summary>
+    private void LayoutLayerButtons()
+    {
+        if (_layerButtonsPanel is null) return;
+        float f = DeviceDpi / 96f;
+        int h = (int)(26 * f), gap = Math.Max(2, (int)(3 * f));
+        int availW = _layerPanel.ClientSize.Width - _layerPanel.Padding.Horizontal;
+        int bw = Math.Max(40, (availW - gap) / 2);
+        for (int i = 0; i < _layerButtons.Count; i++)
+            _layerButtons[i].SetBounds(
+                _layerPanel.Padding.Left + (i % 2 == 0 ? 0 : bw + gap),
+                (i / 2) * (h + gap), bw, h);
+        _layerButtonsPanel.Height = ((_layerButtons.Count + 1) / 2) * (h + gap) + gap;
     }
 
     private void BuildStatus()
     {
-        _status.Items.AddRange(new ToolStripItem[] { _hintLabel, _posLabel, _sizeLabel, _zoomLabel });
+        // 一般 Panel＋Label：StatusStrip 的 Spring/Table 佈局在高 DPI 會把尾端標籤推出可見區（跑版根源之一）
+        _status.Height = 28;
+        _hintLabel.Dock = DockStyle.Fill;   // 剩餘空間＋AutoEllipsis 自動截断
+        _status.Controls.Add(_hintLabel);   // Fill 先加入＝最後排版
+        _status.Controls.Add(_posLabel);
+        _status.Controls.Add(_sizeLabel);
+        _status.Controls.Add(_zoomLabel);   // 後加入者先排＝最貼右緣
+        _toolTip.SetToolTip(_zoomLabel, "點擊選擇縮放比例");
+        _zoomLabel.Click += (_, _) =>
+        {
+            var p = _status.PointToScreen(new Point(_zoomLabel.Bounds.X, _status.Bottom));
+            _zoomMenu.Show(p.X, Math.Max(0, p.Y - _zoomMenu.Height));
+        };
+    }
+
+    private void BuildZoomMenu()
+    {
+        _zoomMenu = new ContextMenuStrip { Font = _menu.Font };
+        foreach (var pct in new[] { 10, 25, 50, 100, 150, 200, 300, 400, 600, 800 })
+        {
+            var item = new ToolStripMenuItem($"{pct}%");
+            int p = pct;
+            item.Click += (_, _) => _canvas.Zoom = p / 100.0;
+            _zoomMenu.Items.Add(item);
+        }
+        var fit = new ToolStripMenuItem("顯示完整圖片");
+        fit.Click += (_, _) => _canvas.FitZoom();
+        var actual = new ToolStripMenuItem("傳真大小 (100%)");
+        actual.Click += (_, _) => _canvas.ResetZoom();
+        _zoomMenu.Items.AddRange(new ToolStripItem[] { new ToolStripSeparator(), fit, actual });
     }
 
     // ------------------------------------------------------------ 選單
@@ -310,7 +434,7 @@ public sealed class MainForm : Form
             Item("圖像資訊", "", Keys.None, () => { using var d = new ImageInfoDialog(_doc); d.ShowDialog(this); }),
             new ToolStripSeparator(),
             Item("反相", "", Keys.None, () => SelectionOps.EffectInvert(_canvas)),
-            Item("灰阶", "", Keys.None, () => SelectionOps.EffectGrayscale(_canvas)),
+            Item("灰階", "", Keys.None, () => SelectionOps.EffectGrayscale(_canvas)),
             Item("褐色調", "", Keys.None, () => _doc.ApplyGlobal(ImageOps.Sepia)),
             Item("調整顏色...", "", Keys.None, AdjustColors),
         });
@@ -325,7 +449,7 @@ public sealed class MainForm : Form
         view.DropDownItems.AddRange(new ToolStripItem[]
         {
             Item("放大", "Ctrl++", Keys.Control | Keys.Oemplus, () => _canvas.ZoomIn()),
-            Item("缩小", "Ctrl+-", Keys.Control | Keys.OemMinus, () => _canvas.ZoomOut()),
+            Item("縮小", "Ctrl+-", Keys.Control | Keys.OemMinus, () => _canvas.ZoomOut()),
             Item("顯示完整圖片", "", Keys.None, () => _canvas.FitZoom()),
             Item("傳真大小 (100%)", "Ctrl+0", Keys.Control | Keys.D0, () => _canvas.ResetZoom()),
             new ToolStripSeparator(),
@@ -387,6 +511,22 @@ public sealed class MainForm : Form
             _sizeDrop.DropDownItems.Add(new ToolStripSeparator());
             _sizeDrop.DropDownItems.Add(rounded);
         }
+    }
+
+    /// <summary>切換工具時讓「大小」按鈕直接顯示目前粗細（優化：減少展開次數）。</summary>
+    private void UpdateSizeDropCaption()
+    {
+        int? v = _canvas.ActiveTool switch
+        {
+            PencilTool => _canvas.Options.PencilWidth,
+            BrushTool => _canvas.Options.BrushWidth,
+            EraserTool => _canvas.Options.EraserWidth,
+            AirbrushTool => _canvas.Options.SprayWidth,
+            LineTool or CurveTool or RectangleTool or RoundedRectangleTool
+                or EllipseTool or PolygonTool or CalloutTool => _canvas.Options.ShapeWidth,
+            _ => null,
+        };
+        _sizeDrop.Text = v is null ? "大小" : $"大小 {v}";
     }
 
     private void RebuildStyleMenuStatic()
@@ -595,7 +735,7 @@ public sealed class MainForm : Form
 
     private void CopyWholeImage()
     {
-        using var img = _doc.Compose().ToArgb32();
+        using var img = _doc.ComposeCopy();
         Clipboard.SetImage(img);
     }
 
@@ -629,7 +769,9 @@ public sealed class MainForm : Form
     private void AdjustColors()
     {
         bool hasSel = _canvas.Selection.IsActive;
-        var target = hasSel ? SelectionOps.GetContent(_canvas) : _doc.Compose();
+        // 一律取副本：無選取時若直接把文件快取交給對話框，對話框存活期間（自動存檔 20 秒排程）
+        // 快取可能被別人收掉，讀 Width 就會丟 ArgumentException
+        var target = hasSel ? SelectionOps.GetContent(_canvas) : _doc.ComposeCopy();
         try
         {
             using var dlg = new AdjustDialog(target);
@@ -638,7 +780,7 @@ public sealed class MainForm : Form
         }
         finally
         {
-            if (hasSel) target.Dispose();
+            target.Dispose();
         }
     }
 
@@ -685,6 +827,7 @@ public sealed class MainForm : Form
     private void ToggleLayerPanel()
     {
         _layerPanel.Visible = !_layerPanel.Visible;
+        _layerSplitter.Visible = _layerPanel.Visible;
         _settings.ShowLayersPanel = _layerPanel.Visible;
         RefreshLayerList();
     }
@@ -770,6 +913,22 @@ public sealed class MainForm : Form
         _doc.SetActiveLayer(j);
     }
 
+    /// <summary>拖曳排序：把清單 srcList 列的圖層移到清單 dstList 列（清單由上而下＝頂層在前）。</summary>
+    private void ReorderLayer(int srcList, int dstList)
+    {
+        if (srcList == dstList || srcList < 0 || srcList >= _layerList.Items.Count) return;
+        var layers = _doc.Layers;
+        int di = layers.Count - 1 - srcList;
+        if (di < 0 || di >= layers.Count) return;
+        var snap = _doc.TakeSnapshotInternal();
+        var layer = layers[di];
+        layers.RemoveAt(di);
+        int di2 = Math.Clamp(layers.Count - 1 - dstList, 0, layers.Count);
+        layers.Insert(di2, layer);
+        _doc.PushStructuralUndo(snap);
+        _doc.SetActiveLayer(layers.IndexOf(layer));
+    }
+
     private void MergeDown()
     {
         int i = _doc.ActiveLayerIndex;
@@ -829,7 +988,7 @@ public sealed class MainForm : Form
         if (!_doc.IsDirty) return;
         try
         {
-            using var img = _doc.Compose();
+            using var img = _doc.ComposeCopy();   // 必須是副本：直接 Dispose 文件快取會讓之後 Compose 全炸
             img.Save(AutoSavePng, System.Drawing.Imaging.ImageFormat.Png);
             File.WriteAllText(AutoSaveMeta, _doc.FilePath ?? "");
         }
@@ -875,12 +1034,12 @@ public sealed class MainForm : Form
 
     private void OnDragEnter(object? sender, DragEventArgs e)
     {
-        e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Effect = e.Data?.GetDataPresent(DataFormats.FileDrop) == true ? DragDropEffects.Copy : DragDropEffects.None;
     }
 
     private void OnDragDrop(object? sender, DragEventArgs e)
     {
-        if (e.Data.GetData(DataFormats.FileDrop) is not string[] files || files.Length == 0) return;
+        if (e.Data?.GetData(DataFormats.FileDrop) is not string[] files || files.Length == 0) return;
         var path = files.FirstOrDefault(f =>
             Path.GetExtension(f).ToLowerInvariant() is ".png" or ".jpg" or ".jpeg" or ".bmp" or ".gif" or ".tif" or ".tiff");
         if (path is not null && ConfirmDiscard()) OpenFile(path);
@@ -912,6 +1071,25 @@ public sealed class MainForm : Form
             case Keys.Control | Keys.OemMinus:
             case Keys.Control | Keys.Subtract: _canvas.ZoomOut(); return true;
             case Keys.Control | Keys.D0: _canvas.ResetZoom(); return true;
+
+            // Ctrl+方向鍵＝選取內容微調 1px（加 Shift 為 10px），對應原版行为
+            case Keys.Control | Keys.Left when _canvas.Selection.IsActive && !editingText:
+                SelectionOps.Nudge(_canvas, -1, 0); return true;
+            case Keys.Control | Keys.Right when _canvas.Selection.IsActive && !editingText:
+                SelectionOps.Nudge(_canvas, 1, 0); return true;
+            case Keys.Control | Keys.Up when _canvas.Selection.IsActive && !editingText:
+                SelectionOps.Nudge(_canvas, 0, -1); return true;
+            case Keys.Control | Keys.Down when _canvas.Selection.IsActive && !editingText:
+                SelectionOps.Nudge(_canvas, 0, 1); return true;
+            case Keys.Control | Keys.Shift | Keys.Left when _canvas.Selection.IsActive && !editingText:
+                SelectionOps.Nudge(_canvas, -10, 0); return true;
+            case Keys.Control | Keys.Shift | Keys.Right when _canvas.Selection.IsActive && !editingText:
+                SelectionOps.Nudge(_canvas, 10, 0); return true;
+            case Keys.Control | Keys.Shift | Keys.Up when _canvas.Selection.IsActive && !editingText:
+                SelectionOps.Nudge(_canvas, 0, -10); return true;
+            case Keys.Control | Keys.Shift | Keys.Down when _canvas.Selection.IsActive && !editingText:
+                SelectionOps.Nudge(_canvas, 0, 10); return true;
+
             case Keys.X when !editingText:
                 _colorPanel.SwapColors();
                 (_canvas.Color1, _canvas.Color2) = (_canvas.Color2, _canvas.Color1);
@@ -945,8 +1123,9 @@ public sealed class MainForm : Form
         }
         _autoSaveTimer.Stop();
         ClearAutoSave();
-        _settings.WindowWidth = Width;
-        _settings.WindowHeight = Height;
+        var restore = WindowState == FormWindowState.Normal ? new Rectangle(Location, Size) : RestoreBounds;
+        _settings.WindowWidth = Math.Max(restore.Width, 640);    // 實體像素；最大化時記 Normal 尺寸
+        _settings.WindowHeight = Math.Max(restore.Height, 480);
         _settings.Maximized = WindowState == FormWindowState.Maximized;
         _settings.RecentColorsHex.Clear();
         _settings.RecentColorsHex.AddRange(_colorPanel.RecentColors.Select(ColorPanel.ToHex));
@@ -954,13 +1133,96 @@ public sealed class MainForm : Form
         base.OnFormClosing(e);
     }
 
+    /// <summary>工具欄 Flow 佈局：視窗寬度改變時重算換行列數與高度。</summary>
+    private void RelayoutToolStrip()
+    {
+        int w = ClientSize.Width;
+        if (w <= 0) return;
+        var pref = _toolStrip.GetPreferredSize(new Size(Math.Max(80, w - 44), 1));
+        int h = Math.Max(pref.Height + 2, (int)(30 * DeviceDpi / 96f));
+        if (_toolStrip.Height != h) _toolStrip.Height = h;
+    }
+
+    protected override void OnClientSizeChanged(EventArgs e)
+    {
+        base.OnClientSizeChanged(e);
+        RelayoutToolStrip();
+    }
+
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        // 以實體像素還原上次視窗大小（存檔值為實體 px，不再經 DPI 二次縮放）
+        if (WindowState == FormWindowState.Normal)
+        {
+            Width = Math.Max(640, _settings.WindowWidth);
+            Height = Math.Max(480, _settings.WindowHeight);
+        }
+        // DPI 縮放後視窗可能超出工作區，收斂並置中
+        if (WindowState == FormWindowState.Normal)
+        {
+            var wa = Screen.FromControl(this).WorkingArea;
+            float f = DeviceDpi / 96f;
+            int maxW = wa.Width - (int)(24 * f), maxH = wa.Height - (int)(24 * f);
+            if (Width > maxW) Width = maxW;
+            if (Height > maxH) Height = maxH;
+            CenterToScreen();
+        }
+        ApplyHiDpiOnce();
         _canvas.Focus();
         UpdateUndoButtons();
+        RefreshLayerList();
+        UpdateStatusSize();
         _colorPanel.Color1 = _canvas.Color1;
         _colorPanel.Color2 = _canvas.Color2;
-        _sizeDrop.Text = "大小";
+        UpdateSizeDropCaption();
+    }
+
+    private bool _hiDpiApplied;
+
+    /// <summary>
+    /// 表單 AutoScaleMode 只縮「尺寸」，不會縮圖示點陣圖與 ListView 欄寬；
+    /// 這裡在視窗顯示後（DeviceDpi 已正確）做一次高解析修正。
+    /// </summary>
+    private void ApplyHiDpiOnce()
+    {
+        if (_hiDpiApplied) return;
+        _hiDpiApplied = true;
+        float f = DeviceDpi / 96f;
+        if (f <= 1.01f) return;
+
+        // 工具列圖示以原生解析度重繪（IconFactory 為向量式重繪，放大不失真）
+        int iconPx = (int)Math.Round(22 * f);
+        foreach (ToolStripItem item in _toolStrip.Items)
+            if (item is ToolStripButton { Image: not null } b && !string.IsNullOrEmpty(b.AccessibleName))
+            {
+                var old = b.Image;
+                b.Image = IconFactory.Make(b.AccessibleName, iconPx);
+                old?.Dispose();
+            }
+        _toolStrip.ImageScalingSize = new Size(iconPx, iconPx);
+
+        // ListView 欄寬不隨 ScaleControl，手動依 DPI 放大
+        if (_layerList.Columns.Count >= 2)
+        {
+            _layerList.Columns[0].Width = (int)(100 * f);
+            _layerList.Columns[1].Width = (int)(50 * f);
+        }
+
+        // 保底：若 AutoScale 未縮到（只增不減，重複執行安全）
+        void AtLeast(Control c, int baseW, int baseH)
+        {
+            int w = (int)(baseW * f), h = (int)(baseH * f);
+            if (baseW > 0 && c.Width < w) c.Width = w;
+            if (baseH > 0 && c.Height < h) c.Height = h;
+        }
+        AtLeast(_colorPanel, 0, 52);      // 調色盤自繪內容高度
+        AtLeast(_layerPanel, 190, 0);     // Dock=Right 寬度
+        LayoutLayerButtons();
+        RelayoutToolStrip();
+
+        // 分割尺限制與視窗下限（MinimumSize 為實體像素）
+        _layerSplitter.MinSize = (int)(150 * f);
+        MinimumSize = new Size((int)(720 * f), (int)(500 * f));
     }
 }

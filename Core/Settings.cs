@@ -5,7 +5,7 @@ namespace PaintClone.Core;
 /// <summary>應用程式設定（視窗狀態、最近檔案、最近顏色），存於 %APPDATA%\PaintClone。</summary>
 public sealed class AppSettings
 {
-    public int WindowWidth = 1100, WindowHeight = 760;
+    public int WindowWidth = 1400, WindowHeight = 900;   // 實體像素（OnShown 套用，超出螢幕自動收斂）
     public bool Maximized;
     public bool ShowLayersPanel = true;
     public bool ShowGrid;
@@ -20,12 +20,16 @@ public sealed class AppSettings
 
     private static string FilePath => Path.Combine(Dir, "settings.json");
 
+    // 設定值是 public 欄位，System.Text.Json 預設只處理 property，
+    // 少了 IncludeFields 就會寫出空的 {}（視窗大小、最近檔案從不曾真的存進去）
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true, IncludeFields = true };
+
     public static AppSettings Load()
     {
         try
         {
             if (File.Exists(FilePath))
-                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new();
+                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath), JsonOptions) ?? new();
         }
         catch { /* 設定損毀時使用預設值 */ }
         return new AppSettings();
@@ -36,8 +40,7 @@ public sealed class AppSettings
         try
         {
             Directory.CreateDirectory(Dir);
-            File.WriteAllText(FilePath, JsonSerializer.Serialize(this,
-                new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(FilePath, JsonSerializer.Serialize(this, JsonOptions));
         }
         catch { /* 無法儲存時靜默略過 */ }
     }

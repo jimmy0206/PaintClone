@@ -21,15 +21,24 @@ public sealed class ColorPanel : Control
 
     private const int Swatch = 15, Gap = 1, BoxSize = 26;
 
+    /// <summary>自繪座標須自行依 DPI 縮放（父容器的 AutoScale 只縮尺寸、不縮 OnPaint 常數）。</summary>
+    private float S => DeviceDpi / 96f;
+
+    private Rectangle Px(int x, int y, int w, int h)
+    {
+        float s = S;
+        return new Rectangle((int)(x * s), (int)(y * s), (int)(w * s), (int)(h * s));
+    }
+
     public event Action<int, Color>? ColorChosen;          // 1 或 2
     public event Action<Color>? ColorUsed;                  // 任何取用（推入最近）
 
     public ColorPanel()
     {
         DoubleBuffered = true;
-        Height = 44;
+        Height = 50;   // Color2 色塊底部在 y=48，44 會截角
+        MinimumSize = new Size(0, 50);   // 父容器 DPI 縮放會連同 MinimumSize 一起放大，防止被壓回未縮放高度
         BackColor = SystemColors.Control;
-        foreach (var c in _custom) { }
     }
 
     public IReadOnlyList<Color> CustomColors => _custom;
@@ -81,33 +90,35 @@ public sealed class ColorPanel : Control
         Invalidate();
     }
 
-    private Rectangle Color1Rect => new(6, 6, BoxSize, BoxSize);
-    private Rectangle Color2Rect => new(6 + BoxSize - 8, 6 + BoxSize - 10, BoxSize, BoxSize);
-    private Rectangle SwapRect => new(70, 8, 18, 14);
-    private Rectangle ResetRect => new(70, 24, 18, 14);
-    private int PaletteStartX => 96;
+    private Rectangle Color1Rect => Px(6, 6, BoxSize, BoxSize);
+    private Rectangle Color2Rect => Px(24, 22, BoxSize, BoxSize);
+    private Rectangle SwapRect => Px(56, 8, 34, 16);
+    private Rectangle ResetRect => Px(56, 27, 34, 16);
+    private int PaletteStartX => (int)(96 * S);
 
     private IEnumerable<(Rectangle rect, Color color, int kind)> Swatches()
     {
+        float s = S;
+        int sw = (int)(Swatch * s), gap = Math.Max(1, (int)(Gap * s));
         int x = PaletteStartX;
         for (int i = 0; i < Standard.Length; i++)
         {
             int col = i % 10, row = i / 10;
-            yield return (new Rectangle(x + col * (Swatch + Gap), 5 + row * (Swatch + Gap) + (row > 0 ? 0 : 1), Swatch, Swatch), Standard[i], 0);
+            yield return (new Rectangle(x + col * (sw + gap), (int)((5 + row * (Swatch + Gap) + (row > 0 ? 0 : 1)) * s), sw, sw), Standard[i], 0);
         }
-        x = PaletteStartX + 10 * (Swatch + Gap) + 12;
+        x = PaletteStartX + (int)((10 * (Swatch + Gap) + 12) * s);
         int idx = 0;
         foreach (var c in _custom)
         {
             int col = idx % 5, row = idx / 5;
-            yield return (new Rectangle(x + col * (Swatch + Gap), 5 + row * (Swatch + Gap) + (row > 0 ? 0 : 1), Swatch, Swatch), c, 1);
+            yield return (new Rectangle(x + col * (sw + gap), (int)((5 + row * (Swatch + Gap) + (row > 0 ? 0 : 1)) * s), sw, sw), c, 1);
             idx++;
         }
         idx = 0;
         foreach (var c in _recent)
         {
             int col = idx % 5, row = idx / 5;
-            yield return (new Rectangle(x + col * (Swatch + Gap), 5 + row * (Swatch + Gap) + (row > 0 ? 0 : 1), Swatch, Swatch), c, 2);
+            yield return (new Rectangle(x + col * (sw + gap), (int)((5 + row * (Swatch + Gap) + (row > 0 ? 0 : 1)) * s), sw, sw), c, 2);
             idx++;
         }
     }
@@ -131,9 +142,13 @@ public sealed class ColorPanel : Control
         }
 
         using (var f = new Font(Font.FontFamily, 7.5f))
+        using (var fmt = (StringFormat)StringFormat.GenericTypographic.Clone())
         {
-            g.DrawString("對調", f, Brushes.Black, SwapRect.X + 18, SwapRect.Y - 1);
-            g.DrawString("重設", f, Brushes.Black, ResetRect.X + 18, ResetRect.Y - 1);
+            // 文字置中於按鈕框內，不再溢出色票區
+            fmt.Alignment = StringAlignment.Center;
+            fmt.LineAlignment = StringAlignment.Center;
+            g.DrawString("對調", f, Brushes.Black, SwapRect, fmt);
+            g.DrawString("重設", f, Brushes.Black, ResetRect, fmt);
         }
 
         foreach (var (rect, color, kind) in Swatches())
@@ -162,14 +177,14 @@ public sealed class ColorPanel : Control
             }
             return;
         }
-        if (new Rectangle(SwapRect.X - 2, SwapRect.Y, 52, SwapRect.Height).Contains(e.Location))
+        if (SwapRect.Contains(e.Location))
         {
             SwapColors();
             ColorChosen?.Invoke(0, _color1); // 0 = 通知同步
             Invalidate();
             return;
         }
-        if (new Rectangle(ResetRect.X - 2, ResetRect.Y, 52, ResetRect.Height).Contains(e.Location))
+        if (ResetRect.Contains(e.Location))
         {
             _color1 = Color.Black; _color2 = Color.White;
             ColorChosen?.Invoke(0, _color1);

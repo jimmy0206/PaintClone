@@ -190,9 +190,16 @@ public sealed class PaintDocument : IDisposable
         StructureChanged?.Invoke(this, EventArgs.Empty);
     }
 
+    /// <summary>
+    /// 圖層堆疊的合成結果。傳回的是「文件持有」的快取物件：呼叫端只能讀取，不得 Dispose，
+    /// 否則之後所有用到 Compose 的功能（取色、調整顏色、存檔、圖像資訊）都會丟
+    /// ArgumentException("Parameter is not valid")。需要能自行釋放的副本請用 ComposeCopy。
+    /// </summary>
     public Bitmap Compose()
     {
-        if (_composed is not null) return _composed;
+        // 自我修復：萬一快取被呼叫端誤 Dispose，重建而不是讓後續功能全部崩潰
+        if (_composed is not null && CacheAlive(_composed)) return _composed;
+        _composed = null;
         var bmp = new Bitmap(Math.Max(1, Size.Width), Math.Max(1, Size.Height), PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(bmp))
         {
@@ -202,6 +209,16 @@ public sealed class PaintDocument : IDisposable
         }
         _composed = bmp;
         return bmp;
+    }
+
+    /// <summary>合成的獨立副本，呼叫端負責 Dispose。</summary>
+    public Bitmap ComposeCopy() => Compose().ToArgb32();
+
+    /// <summary>GDI+ 沒有 Image.IsDisposed；已釋放的位圖存取任何屬性都會丟 ArgumentException，只能先存取一次試探。</summary>
+    private static bool CacheAlive(Image img)
+    {
+        try { _ = img.Width; return true; }
+        catch (ArgumentException) { return false; }
     }
 
     public void InvalidateComposed()
@@ -268,8 +285,9 @@ public sealed class PaintDocument : IDisposable
         for (int i = 0; i < Layers.Count; i++)
         {
             var old = Layers[i].Image;
-            Layers[i].Image = transform(old);
-            old.Dispose();
+            var result = transform(old);
+            if (!ReferenceEquals(result, old)) old.Dispose();
+            Layers[i].Image = result;
         }
         PushStructuralUndo(snap);
     }

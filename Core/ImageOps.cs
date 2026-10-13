@@ -213,7 +213,6 @@ public static class ImageOps
     {
         double th = Math.Tan(hDeg * Math.PI / 180.0); // x' 受 y 影響
         double tv = Math.Tan(vDeg * Math.PI / 180.0); // y' 受 x 影響
-        double x0 = 0, y0 = 0;
         double x1 = src.Width, y1 = src.Height;
         // 四角變換後範圍
         double minX = 0, minY = 0, maxX = x1, maxY = y1;
@@ -288,10 +287,15 @@ public static class ImageOps
             Math.Min(255, (int)(c.R * .349 + c.G * .686 + c.B * .168)),
             Math.Min(255, (int)(c.R * .272 + c.G * .534 + c.B * .131))));
 
-    /// <summary>色相(-180..180)、飽和度(-100..100 %)、亮度(-100..100)、對比(-100..100) 調整。</summary>
+    /// <summary>色相(-180..180)、飽和度(-100..100 %)、亮度(-100..100)、對比(-100..100) 調整。
+    /// 傳回**新**位圖，由呼叫端 Dispose。</summary>
     public static Bitmap Adjust(Bitmap src, float hue, float saturation, float brightness, float contrast)
     {
-        using var img = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
+        // 這裡刻意「不用」using var：下面 hue==0 時會把 img 直接當傳回值交出去，
+        // 而 using var 即使在 return 之後仍會 Dispose 它，呼叫端就會拿到一張已釋放的位圖
+        //（色相=0 是預設值，所以「調整顏色」按確定或預覽一定炸：
+        //  PictureBox 重繪 → ImageAnimator 讀 FrameDimensionsList → ArgumentException "Parameter is not valid"）。
+        var img = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(img))
         using (var attrs = new ImageAttributes())
         {
@@ -311,9 +315,9 @@ public static class ImageOps
             float bAdj = brightness / 255f + 1f;
             var bright = new float[][]
             {
-                new[]{bAdj,0,0,0,0}, new[]{0,bAdj,0,0,0},
-                new[]{0,0,bAdj,0,0}, new[]{0,0,0,1,0},
-                new[]{0,0,0,0,1},
+                new[]{bAdj,0f,0f,0f,0f}, new[]{0f,bAdj,0f,0f,0f},
+                new[]{0f,0f,bAdj,0f,0f}, new[]{0f,0f,0f,1f,0f},
+                new[]{0f,0f,0f,0f,1f},
             };
             cm = Multiply(cm, bright);
             // 對比
@@ -321,19 +325,20 @@ public static class ImageOps
             float shift = 0.5f * (1f - cAdj);
             var cont = new float[][]
             {
-                new[]{cAdj,0,0,0,0}, new[]{0,cAdj,0,0,0},
-                new[]{0,0,cAdj,0,0}, new[]{0,0,0,1,0},
-                new[]{shift,shift,shift,0,1},
+                new[]{cAdj,0f,0f,0f,0f}, new[]{0f,cAdj,0f,0f,0f},
+                new[]{0f,0f,cAdj,0f,0f}, new[]{0f,0f,0f,1f,0f},
+                new[]{shift,shift,shift,0f,1f},
             };
             cm = Multiply(cm, cont);
-            using var matrix = new ColorMatrix(cm);
+            var matrix = new ColorMatrix(cm);
             attrs.SetColorMatrix(matrix, ColorMatrixFlag.Default, ColorAdjustType.Bitmap);
             g.Clear(Color.Transparent);
             g.DrawImage(src, new Rectangle(0, 0, src.Width, src.Height),
                 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, attrs);
         }
-        if (Math.Abs(hue) < 0.01f) return img;
-        return MapPixels(img, c => ShiftHue(c, hue));
+        if (Math.Abs(hue) < 0.01f) return img;                          // 直接交給呼叫端釋放
+        try { return MapPixels(img, c => ShiftHue(c, hue)); }           // 色相換算期間 img 必須存活
+        finally { img.Dispose(); }
     }
 
     private static float[][] IdentityArr() => new float[][]

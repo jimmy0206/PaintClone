@@ -3,8 +3,51 @@ using PaintClone.Rendering;
 
 namespace PaintClone.UI;
 
+/// <summary>
+/// 對話框基底：把手寫的控制項座標／尺寸／間距依裝置 DPI 整體放大。
+/// PerMonitorV2 只會自動放大「字型」，不會放大程式碼裡寫的像素常數，所以 200% 下
+/// ClientSize 與控制項仍是 96dpi 的數值（實測 ResizeDialog 只有 326x281 實體像素），
+/// 結果就是文字壓色票、確定/取消按鈕被剪掉。
+/// 不用 AutoScaleMode.Dpi：實測對這種沒有設計檔（.Designer.cs）的純程式碼表單不會觸發縮放。
+/// 縮放放在 OnLoad，因為那時 handle 已建立、DeviceDpi 才是螢幕上的真實值。
+/// </summary>
+public abstract class DialogBase : Form
+{
+    private bool _dpiScaled;
+
+    protected DialogBase() => AutoScaleMode = AutoScaleMode.None;
+
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        if (_dpiScaled) return;
+        _dpiScaled = true;
+        float f = DeviceDpi / 96f;
+        if (Math.Abs(f - 1f) < 0.01f) return;      // 96dpi：設計基準，不需縮放
+        ClientSize = new Size(Scale(ClientSize.Width, f), Scale(ClientSize.Height, f));
+        ScaleTree(this, f);
+    }
+
+    private static int Scale(int v, float f) => Math.Max(1, (int)Math.Round(v * f));
+
+    /// <summary>遞迴縮放子控制項的位置、尺寸、Padding 與 Margin（字型已由 PerMonitorV2 處理，不再動它）。</summary>
+    private static void ScaleTree(Control parent, float f)
+    {
+        foreach (Control c in parent.Controls)
+        {
+            ScaleTree(c, f);
+            c.Padding = new Padding(Scale(c.Padding.Left, f), Scale(c.Padding.Top, f),
+                                    Scale(c.Padding.Right, f), Scale(c.Padding.Bottom, f));
+            c.Margin = new Padding(Scale(c.Margin.Left, f), Scale(c.Margin.Top, f),
+                                   Scale(c.Margin.Right, f), Scale(c.Margin.Bottom, f));
+            var b = c.Bounds;
+            c.Bounds = new Rectangle(Scale(b.X, f), Scale(b.Y, f), Scale(b.Width, f), Scale(b.Height, f));
+        }
+    }
+}
+
 /// <summary>調整圖片大小與解析度（對應原版 ResizeImage 對話框）。</summary>
-public sealed class ResizeDialog : Form
+public sealed class ResizeDialog : DialogBase
 {
     private readonly NumericUpDown _width, _height;
     private readonly RadioButton _px, _percent;
@@ -23,7 +66,9 @@ public sealed class ResizeDialog : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(300, 210);
+        // 內容（2 個 radio + 2 列數值 + 2 個 checkbox + 按鈕列，含 FlowLayoutPanel 的 Margin 與 Padding）
+        // 實際需要約 256 高；原本是 210，確定／取消會被擠到視窗外面
+        ClientSize = new Size(330, 275);
 
         var layout = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12), FlowDirection = FlowDirection.TopDown, WrapContents = false };
 
@@ -93,7 +138,7 @@ public sealed class ResizeDialog : Form
 }
 
 /// <summary>傾斜對話框（原版 SkewImage）。</summary>
-public sealed class SkewDialog : Form
+public sealed class SkewDialog : DialogBase
 {
     private readonly NumericUpDown _h, _v;
     public double HorizontalDeg => (double)_h.Value;
@@ -105,7 +150,8 @@ public sealed class SkewDialog : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(260, 140);
+        // 寬 260 會讓 240 寬的按鈕列加 Padding 後溢出；高 140 剛好把按鈕列擠掉
+        ClientSize = new Size(280, 165);
 
         var layout = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12), FlowDirection = FlowDirection.TopDown, WrapContents = false };
         var r1 = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, AutoSize = true };
@@ -129,7 +175,7 @@ public sealed class SkewDialog : Form
 }
 
 /// <summary>任意角度旋轉（原版 RotateCustomDialog）。</summary>
-public sealed class RotateCustomDialog : Form
+public sealed class RotateCustomDialog : DialogBase
 {
     private readonly NumericUpDown _angle;
     public double Angle => (double)_angle.Value;
@@ -140,7 +186,7 @@ public sealed class RotateCustomDialog : Form
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
         StartPosition = FormStartPosition.CenterParent;
-        ClientSize = new Size(260, 120);
+        ClientSize = new Size(280, 130);   // 原 260 寬讓 240 寬按鈕列 + Padding 溢出
 
         var layout = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12), FlowDirection = FlowDirection.TopDown, WrapContents = false };
         var r1 = new FlowLayoutPanel { FlowDirection = FlowDirection.LeftToRight, AutoSize = true };
@@ -159,7 +205,7 @@ public sealed class RotateCustomDialog : Form
 }
 
 /// <summary>色彩調整（色相／飽和度／亮度／對比）＋即時預覽。</summary>
-public sealed class AdjustDialog : Form
+public sealed class AdjustDialog : DialogBase
 {
     private readonly TrackBar _hue, _sat, _bright, _contrast;
     private readonly Label _previewHolder = new();
@@ -222,6 +268,7 @@ public sealed class AdjustDialog : Form
         {
             using var small = ImageOps.Resize(_source, Math.Max(1, _preview.Width), Math.Max(1, _preview.Height), true);
             var result = ImageOps.Adjust(small, Hue, Saturation, Brightness, Contrast);
+            _preview.Image = null;      // 先解除參考再釋放舊圖，PictureBox 才不會重繪到已釋放的影像
             _previewBmp?.Dispose();
             _previewBmp = result;
             _preview.Image = result;
@@ -240,7 +287,7 @@ public sealed class AdjustDialog : Form
     }
 }
 
-public sealed class ImageInfoDialog : Form
+public sealed class ImageInfoDialog : DialogBase
 {
     public ImageInfoDialog(PaintClone.Documents.PaintDocument doc)
     {
@@ -269,7 +316,7 @@ public sealed class ImageInfoDialog : Form
     }
 }
 
-public sealed class AboutDialog : Form
+public sealed class AboutDialog : DialogBase
 {
     public AboutDialog()
     {

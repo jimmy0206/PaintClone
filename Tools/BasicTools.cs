@@ -26,17 +26,31 @@ public abstract class StrokeTool : Tool
     {
         if (Scope is null) return;
         DrawSegment(_last, p);
+        InvalidateSegment(_last, p);
         _last = p;
-        Canvas.Invalidate();
     }
 
     public override void OnMouseUp(PointF p, MouseButtons btn)
     {
         if (Scope is null) return;
         DrawSegment(_last, p);
+        InvalidateSegment(_last, p);
         Scope.Commit();
         Scope = null;
-        Canvas.Invalidate();
+    }
+
+    /// <summary>只重繪筆劃涵蓋的螢幕範圍（即時顯示＋高效能）；pad 涵蓋最粗筆刷。</summary>
+    private void InvalidateSegment(PointF a, PointF b)
+    {
+        if (Canvas is null) { Doc.InvalidateComposed(); return; }
+        var sa = Canvas.ToScreen(a);
+        var sb = Canvas.ToScreen(b);
+        var r = Rectangle.Union(
+            new Rectangle((int)sa.X, (int)sa.Y, 1, 1),
+            new Rectangle((int)sb.X, (int)sb.Y, 1, 1));
+        int pad = (int)(64 * Canvas.Zoom) + 8;
+        r.Inflate(pad, pad);
+        Canvas.Invalidate(r);
     }
 
     public override void OnDeactivate()
@@ -71,6 +85,9 @@ public sealed class PencilTool : StrokeTool
 {
     public override string Name => "鉛筆";
     public override string Hint => "鉛筆：以 1~5 像素粗細自由繪製（左鍵＝顏色1，右鍵＝顏色2）";
+    public override Cursor Cursor => Opt.PencilWidth <= 2
+        ? Cursors.Cross
+        : ToolCursor.ForWidth(Opt.PencilWidth, Canvas?.Zoom ?? 1);
 
     protected override void DrawDot(PointF p) => DrawSegment(p, p);
 
@@ -118,6 +135,7 @@ public sealed class BrushTool : StrokeTool
 {
     public override string Name => "筆刷";
     public override string Hint => "筆刷：平滑反鋸齒筆劃，可在工具列選擇粗細";
+    public override Cursor Cursor => ToolCursor.ForWidth(Math.Max(2, Opt.BrushWidth), Canvas?.Zoom ?? 1);
 
     protected override void DrawDot(PointF p) => DrawSegment(p, p);
 
@@ -136,6 +154,7 @@ public sealed class EraserTool : StrokeTool
 {
     public override string Name => "橡皮擦";
     public override string Hint => "橡皮擦：背景層以顏色2擦除；其他圖層擦為透明（優化）";
+    public override Cursor Cursor => ToolCursor.ForWidth(Math.Max(2, Opt.EraserWidth), Canvas?.Zoom ?? 1);
 
     protected override void DrawDot(PointF p) => DrawSegment(p, p);
 
@@ -165,7 +184,7 @@ public sealed class AirbrushTool : StrokeTool
 
     public override string Name => "噴槍";
     public override string Hint => "噴槍：按住滑鼠繼續噴灑（原版功能完整保留）";
-    public override Cursor Cursor => Cursors.Cross;
+    public override Cursor Cursor => ToolCursor.ForWidth(Math.Max(2, Opt.SprayWidth), Canvas?.Zoom ?? 1);
 
     public override void OnMouseDown(PointF p, MouseButtons btn)
     {

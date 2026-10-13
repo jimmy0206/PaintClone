@@ -15,6 +15,9 @@ public abstract class ShapeToolBase : Tool
 
     protected bool Right { get; private set; }
 
+    /// <summary>拖曳時是否在游標旁顯示尺寸（直線等不適用者覆寫為 false）。</summary>
+    protected virtual bool ShowSizeInfo => true;
+
     protected void BeginShape(PointF p, MouseButtons btn)
     {
         Right = btn == MouseButtons.Right;
@@ -37,6 +40,17 @@ public abstract class ShapeToolBase : Tool
     {
         if (!_dragging) return;
         _cur = p;
+        if (ShowSizeInfo)
+        {
+            var r = Normalize(_p0, _cur);
+            if (SquareConstraint)
+            {
+                float side = Math.Max(r.Width, r.Height);
+                Canvas.ShowDragInfo($"{(int)side} × {(int)side}");
+            }
+            else
+                Canvas.ShowDragInfo($"{(int)r.Width} × {(int)r.Height}");
+        }
         Canvas.Invalidate();
     }
 
@@ -100,6 +114,7 @@ public abstract class ShapeToolBase : Tool
         if (Scope is not null) { Scope.Abort(); Scope = null; }
         _base?.Dispose(); _base = null;
         _dragging = false;
+        Canvas.ShowDragInfo(null);
         Canvas.Invalidate();
     }
 
@@ -132,6 +147,16 @@ public sealed class LineTool : ShapeToolBase
 {
     public override string Name => "直線";
     public override string Hint => "直線：按住 Shift 可鎖 15° 倍角";
+    protected override bool ShowSizeInfo => false;
+
+    public override void OnMouseMove(PointF p, MouseButtons btn)
+    {
+        base.OnMouseMove(p, btn);
+        if (!_dragging) return;
+        var (a, b) = Constrain(_p0, p);
+        double len = Math.Sqrt((b.X - a.X) * (b.X - a.X) + (b.Y - a.Y) * (b.Y - a.Y));
+        Canvas.ShowDragInfo($"{Math.Round(len)} px");
+    }
 
     protected override void CommitShape()
     {
@@ -412,6 +437,11 @@ public sealed class CalloutTool : ShapeToolBase
         if (_dragging || _tailPhase)
         {
             _cur = p;
+            if (_dragging)
+            {
+                var r = Normalize(_p0, _cur);
+                Canvas.ShowDragInfo($"{(int)r.Width} × {(int)r.Height}");
+            }
             Canvas.Invalidate();
         }
     }

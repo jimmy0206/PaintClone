@@ -13,6 +13,7 @@ public sealed class SelectTool : Tool
     private State _state;
     private PointF _anchor;
     private Rectangle _tempRect;
+    private bool _moved;                    // 是否超過拖曳閾值（區分點擊與拖曳）
 
     private Bitmap? _float;
     private RectangleF _floatTarget;      // 浮動內容目前的目標矩形
@@ -23,10 +24,8 @@ public sealed class SelectTool : Tool
     private Region? _floatRegion;
 
     public override string Name => "選取";
-    public override string Hint => "選取：拖曳建立矩形選取；於選取內拖曳可移動，拖曳把手可縮放";
-    public override Cursor Cursor => Cursors.Default;
-
-    private RectangleF SelectionScreenBounds() => Sel.Bounds;
+    public override string Hint => "選取：拖曳建立矩形選取；於選取內拖曳可移動，拖曳把手可縮放，Esc 取消，Ctrl+方向鍵微調";
+    public override Cursor Cursor => Cursors.Cross;
 
     // 8 個把手：0-3 四角、4-7 四邊中點
     private static PointF[] Handles(RectangleF b) => new[]
@@ -37,9 +36,20 @@ public sealed class SelectTool : Tool
         new PointF((b.Left + b.Right) / 2, b.Bottom), new PointF(b.Left, (b.Top + b.Bottom) / 2),
     };
 
+    private static Cursor HandleCursor(int i) => i switch
+    {
+        0 or 2 => Cursors.SizeNWSE,
+        1 or 3 => Cursors.SizeNESW,
+        4 or 6 => Cursors.SizeNS,
+        _ => Cursors.SizeWE,
+    };
+
+    /// <summary>有選取且未處於拖曳流程中，即可操作（含外部 Ctrl+A 建立的選取）。</summary>
+    private bool CanGrab => Sel.IsActive && _state is State.Idle or State.Ready;
+
     private int HitHandle(PointF p)
     {
-        if (_state != State.Ready || !Sel.IsActive) return -1;
+        if (!CanGrab) return -1;
         float tol = 6 / (float)Math.Max(0.05, Canvas.Zoom);
         var hs = Handles(Sel.Bounds);
         for (int i = 0; i < hs.Length; i++)
@@ -53,7 +63,7 @@ public sealed class SelectTool : Tool
         if (btn != MouseButtons.Left) return;
         if (_state is State.Moving or State.Scaling) return;
 
-        if (_state == State.Ready && Sel.IsActive)
+        if (CanGrab)
         {
             _handle = HitHandle(p);
             if (_handle >= 0) { BeginFloat(p, scaling: true); return; }
@@ -63,6 +73,7 @@ public sealed class SelectTool : Tool
         _state = State.MakingRect;
         _anchor = p;
         _tempRect = Rectangle.Empty;
+        _moved = false;
     }
 
     private void BeginFloat(PointF p, bool scaling)
@@ -93,6 +104,7 @@ public sealed class SelectTool : Tool
             }
         }
 
+        _moved = false;
         if (scaling)
         {
             _state = State.Scaling;
@@ -107,8 +119,42 @@ public sealed class SelectTool : Tool
         Canvas.Invalidate();
     }
 
+    /// <summary>取消進行中的移動/縮放：把內容放回原位，撤銷挖洞。</summary>
+    private void RestoreFloat()
+    {
+        if (_float is not null)
+        {
+            using (var g = Graphics.FromImage(Doc.Active.Image))
+            using (var region = _floatRegion!.Clone() as Region)
+            {
+                g.SetClip(region, CombineMode.Replace);
+                g.DrawImage(_float, Rectangle.Round(_floatSourceRect));
+            }
+        }
+        _moveScope?.Abort();
+        _moveScope = null;
+        _float?.Dispose(); _float = null;
+        _floatRegion?.Dispose(); _floatRegion = null;
+        Canvas.ShowDragInfo(null);
+        Canvas.Invalidate();
+    }
+
     public override void OnMouseMove(PointF p, MouseButtons btn)
     {
+        // 靜止懸停：依位置給游標回饋（把手→方向箭頭、選取內→移動、其他→十字）
+        if (btn == MouseButtons.None && _state is not (State.Moving or State.Scaling or State.MakingRect))
+        {
+            if (CanGrab)
+            {
+                int h = HitHandle(p);
+                Canvas.Cursor = h >= 0 ? HandleCursor(h)
+                    : Sel.Contains(Point.Round(p)) ? Cursors.SizeAll
+                    : Cursors.Cross;
+            }
+            return;
+        }
+
+        float dragThreshold = 2 / (float)Math.Max(0.05, Canvas.Zoom);
         switch (_state)
         {
             case State.MakingRect:
@@ -117,6 +163,9 @@ public sealed class SelectTool : Tool
                         Math.Min(_anchor.X, p.X), Math.Min(_anchor.Y, p.Y),
                         Math.Abs(p.X - _anchor.X), Math.Abs(p.Y - _anchor.Y))),
                     new Rectangle(0, 0, Doc.Size.Width, Doc.Size.Height));
+                if (!_moved && (Math.Abs(p.X - _anchor.X) > dragThreshold || Math.Abs(p.Y - _anchor.Y) > dragThreshold))
+                    _moved = true;
+                Canvas.ShowDragInfo(_moved ? $"{_tempRect.Width} × {_tempRect.Height}" : null);
                 Canvas.Invalidate();
                 break;
 
@@ -125,11 +174,15 @@ public sealed class SelectTool : Tool
                     Math.Clamp(p.X - _grabOffset.X, -_floatSourceRect.Width / 2, Doc.Size.Width - _floatSourceRect.Width / 2),
                     Math.Clamp(p.Y - _grabOffset.Y, -_floatSourceRect.Height / 2, Doc.Size.Height - _floatSourceRect.Height / 2),
                     _floatSourceRect.Width, _floatSourceRect.Height);
+                _moved = true;
+                Canvas.ShowDragInfo($"{(int)_floatTarget.X}, {(int)_floatTarget.Y}");
                 Canvas.Invalidate();
                 break;
 
             case State.Scaling:
                 _floatTarget = ComputeScale(_floatSourceRect, _handle, p);
+                _moved = true;
+                Canvas.ShowDragInfo($"{(int)_floatTarget.Width} × {(int)_floatTarget.Height}");
                 Canvas.Invalidate();
                 break;
         }
@@ -157,17 +210,20 @@ public sealed class SelectTool : Tool
         switch (_state)
         {
             case State.MakingRect:
-                if (_tempRect.Width >= 1 && _tempRect.Height >= 1)
+                if (_moved && _tempRect.Width >= 1 && _tempRect.Height >= 1)
                 {
                     Sel.SetRect(_tempRect);
                     _state = State.Ready;
                 }
-                else { Sel.Clear(); _state = State.Idle; }
+                else { Sel.Clear(); _state = State.Idle; }   // 點擊未拖曳＝放棄舊選取（與原版一致）
                 break;
 
             case State.Moving:
             case State.Scaling:
-                FinishFloat(scaling: _state == State.Scaling);
+                if (!_moved)
+                    RestoreFloat();          // 單純點在選取上：原狀還原，選取維持
+                else
+                    FinishFloat(scaling: _state == State.Scaling);
                 _state = State.Ready;
                 break;
         }
@@ -199,11 +255,21 @@ public sealed class SelectTool : Tool
         _moveScope = null;
         _float?.Dispose(); _float = null;
         _floatRegion?.Dispose(); _floatRegion = null;
+        Canvas.ShowDragInfo(null);
 
-        if (scaling && Sel.Mode == SelectionManager.SelMode.Rect)
-            Sel.SetRect(target);
+        // 完成後選取跟隨內容（優化：原版移動後選取即消失）
+        if (scaling)
+        {
+            if (Sel.Mode == SelectionManager.SelMode.Rect)
+                Sel.SetRect(target);   // 矩形選取縮放後框跟著變
+            else
+                Sel.Clear();           // 套索/遮罩縮放後形狀無法保留（與原版一致）
+        }
         else
-            Sel.Clear();
+        {
+            Sel.Translate((int)Math.Round(_floatTarget.X - _floatSourceRect.X),
+                          (int)Math.Round(_floatTarget.Y - _floatSourceRect.Y));
+        }
         Canvas.Invalidate();
     }
 
@@ -230,22 +296,47 @@ public sealed class SelectTool : Tool
             g.PixelOffsetMode = PixelOffsetMode.Half;
             g.DrawImage(_float, target);
         }
+        else if (CanGrab)
+        {
+            // 可見縮放把手（優化：原版把手細小難擊，這裡維持約 6 螢幕像素）
+            float inv = 1 / (float)Math.Max(0.2, Canvas.Zoom);
+            float hs = Math.Max(1.5f, 3f * inv);
+            using var fb = new SolidBrush(Color.White);
+            using var fp = new Pen(Color.Black, inv);
+            foreach (var h in Handles(Sel.Bounds))
+            {
+                var r = new RectangleF(h.X - hs, h.Y - hs, hs * 2, hs * 2);
+                g.FillRectangle(fb, r.X, r.Y, r.Width, r.Height);
+                g.DrawRectangle(fp, r.X, r.Y, r.Width, r.Height);
+            }
+        }
     }
 
     public override void OnDeactivate()
     {
         if (_state is State.Moving or State.Scaling)
-            FinishFloat(scaling: _state == State.Scaling);
+        {
+            if (_moved) FinishFloat(scaling: _state == State.Scaling);
+            else RestoreFloat();
+        }
         _state = Sel.IsActive ? State.Ready : State.Idle;
     }
 
     public override void OnKeyDown(KeyEventArgs e)
     {
-        if (e.KeyCode == Keys.Escape && _state == State.MakingRect)
+        switch (e.KeyCode)
         {
-            _state = State.Idle;
-            Canvas.Invalidate();
-            e.Handled = true;
+            case Keys.Escape when _state == State.MakingRect:
+                _state = State.Idle;
+                Canvas.ShowDragInfo(null);
+                Canvas.Invalidate();
+                e.Handled = true;
+                break;
+            case Keys.Escape when _state is State.Moving or State.Scaling:
+                RestoreFloat();
+                _state = State.Ready;
+                e.Handled = true;
+                break;
         }
     }
 
@@ -304,6 +395,10 @@ public sealed class LassoTool : Tool
         using var pen = new Pen(Color.Black, 1 / (float)Math.Max(0.05, Canvas.Zoom))
         { DashPattern = new float[] { 3, 3 } };
         g.DrawLines(pen, _pts.ToArray());
+        // 灰色參考線：放開滑鼠後將由此閉合
+        using var hint = new Pen(Color.FromArgb(140, Color.Gray), 1 / (float)Math.Max(0.05, Canvas.Zoom))
+        { DashPattern = new float[] { 2, 3 } };
+        g.DrawLine(hint, _pts[^1], _pts[0]);
     }
 
     public override void OnDeactivate()
@@ -380,6 +475,8 @@ public sealed class TextTool : Tool
         var screen = Canvas.ToScreen(_imgPos);
         _editor.Location = new Point((int)screen.X, (int)screen.Y);
         _editor.Font = new Font(Opt.TextFont.FontFamily, Opt.TextFont.Size * (float)Canvas.Zoom);
+        AutoSizeEditor();   // 縮放後必須重算尺寸，否則殘留巨大白框（跑版來源）
+        _editor.BringToFront();
     }
 
     private void AbortEditor()

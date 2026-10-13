@@ -59,6 +59,52 @@ public static class SelectionOps
         canvas.Invalidate();
     }
 
+    /// <summary>以 1px 級距搬移選取內容（Ctrl+方向鍵；原版小畫家行為），單步可復原。</summary>
+    public static void Nudge(CanvasControl canvas, int dx, int dy)
+    {
+        var doc = canvas.Doc;
+        var sel = canvas.Selection;
+        if (!sel.IsActive || (dx == 0 && dy == 0)) return;
+        var bounds = sel.Bounds;
+        var scope = doc.BeginEdit();
+        using var content = sel.GetContent(doc);
+
+        // 挖洞（背景層以顏色2、其他圖層擦透明）
+        using (var g = Graphics.FromImage(doc.Active.Image))
+        using (var region = sel.GetRegion())
+        {
+            g.SetClip(region, CombineMode.Replace);
+            if (doc.Active.IsBackground)
+            {
+                using var b = new SolidBrush(canvas.Color2);
+                g.FillRectangle(b, bounds);
+            }
+            else
+            {
+                g.CompositingMode = CompositingMode.SourceCopy;
+                using var t = new SolidBrush(Color.Transparent);
+                g.FillRectangle(t, bounds);
+            }
+        }
+
+        // 位移後貼回
+        using (var g = Graphics.FromImage(doc.Active.Image))
+        using (var moved = sel.GetRegion())
+        {
+            using var m = new Matrix();
+            m.Translate(dx, dy);
+            moved.Transform(m);
+            g.SetClip(moved, CombineMode.Replace);
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.DrawImageUnscaled(content, bounds.X + dx, bounds.Y + dy);
+        }
+
+        scope.AddDirty(Rectangle.Union(bounds, new Rectangle(bounds.X + dx, bounds.Y + dy, bounds.Width, bounds.Height)));
+        scope.Commit();
+        sel.Translate(dx, dy);
+        canvas.Invalidate();
+    }
+
     /// <summary>貼上：建立新圖層（優化：原版會阻塞的浮動選取在圖層制下更直覺）。</summary>
     public static void PasteImage(CanvasControl canvas, Bitmap bmp)
     {
